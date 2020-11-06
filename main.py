@@ -19,8 +19,8 @@ FLAGS = flags.FLAGS
 FLAGS(sys.argv)
 
 def main():
-    A2B_generator = ResnetGenerator(input_shape=(256, 256, 3))
-    B2A_generator = ResnetGenerator(input_shape=(256, 256, 3))
+    A2B_generator = ResnetGenerator(input_shape=(FLAGS.img_size, FLAGS.img_size, 3))
+    B2A_generator = ResnetGenerator(input_shape=(FLAGS.img_size, FLAGS.img_size, 3))
     
     ONNX_A2B_path = "C:/Users/Yuhwan/Documents/New/A2B_generator.onnx"
     ONNX_B2A_path = "C:/Users/Yuhwan/Documents/New/B2A_generator.onnx"

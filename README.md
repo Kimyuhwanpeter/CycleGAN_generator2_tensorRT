@@ -1,1 +1,12 @@
-# CycleGAN_generator2_tensorRT
+# TensorRT using ONNX model (python and C++)
+
+
+
+## main.py file
+
+* Get onnx model from tensorflow model (modified model)
+
+## generator_model.py file
+
+* modified model (from CycleGAN)
+

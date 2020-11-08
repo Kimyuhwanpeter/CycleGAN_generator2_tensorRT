@@ -13,5 +13,7 @@
 ## Plan for implementation
 * Check the inference time using C++ in window
 * Check the inference time using python in ubuntu
-* Before using C++, Need to know the function for tensorRT --> first need to do!
+* Before using C++, Need to know the function for tensorRT --> first need to do! (Monday, tomorrow)
+* Check the NVIDIA web page to find the "function"
+* Prefer to implement tensorRT using C++ (Very important!!!!)
 

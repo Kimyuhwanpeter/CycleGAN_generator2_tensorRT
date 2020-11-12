@@ -1,7 +1,6 @@
 #include <algorithm> 
 #include <chrono> 
 #include <cstdlib> 
-#include <cuda_runtime_api.h> 
 #include <fstream> 
 #include <iostream> 
 #include <string> 
@@ -10,24 +9,17 @@
 #include <cassert> 
 #include <vector>
 #include <memory>
+#include <iterator>
+
 #include "include/NvInfer.h" 
-#include "include/NvUffParser.h" 
-#include "include/NvUtils.h"
+//#include <cuda_runtime.h>
+#include "cudaWrapper.h"
 #include "include/NvOnnxParser.h"
-#include "opencv2\core\cuda_types.hpp"
-#include "opencv2\core\cuda.hpp"
-#include "opencv2/core/core.hpp"
-#include "opencv2/highgui/highgui.hpp"
-#include "opencv2/imgproc/imgproc.hpp"
 
-using namespace std;
 using namespace nvinfer1;
-using namespace nvuffparser;
-using namespace cv;
+std::ostream& operator<<(std::ostream& o, const ILogger::Severity severity);
 
-#define re_width 256
-#define re_height 256
-
+////////////////////////////////////////////////////////////////////////////////////////////////////////
 class Logger : public nvinfer1::ILogger
 {
 public:
@@ -39,105 +31,164 @@ public:
 	}
 } gLogger;
 
-// destroy TensorRT objects if something goes wrong
-struct TRTDestroy
+template <typename T>
+struct Destroy
 {
-	template< class T >
-	void operator()(T* obj) const
+	void operator()(T* t) const
 	{
-		if (obj)
-		{
-			obj->destroy();
-		}
+		t->destroy();
 	}
 };
 
-template< class T >
-using TRTUniquePtr = std::unique_ptr< T, TRTDestroy >;
-
-std::vector<cv::cuda::GpuMat> preprocess_img(const std::string& image_path, float *gpu_input, const nvinfer1::Dims& dims)
+std::string getBasename(std::string const& path)
 {
-	cv::Mat img = cv::imread(image_path);
-	cv::Mat resize_img;
-	cv::resize(img, resize_img, cv::Size(re_width, re_height));
-	if (img.empty())
-		assert(img.empty() == true && " There is no input image");
-	else
+#ifdef _WIN32
+	constexpr char SEPARATOR = '\\';
+#else
+	constexpr char SEPARATOR = '/';
+#endif
+	int baseId = path.rfind(SEPARATOR) + 1;
+	return path.substr(baseId, path.rfind('.') - baseId);
+}
+
+// Returns empty string iff can't read the file
+std::string readBuffer(std::string const& path)
+{
+	std::string buffer;
+	std::ifstream stream(path.c_str(), std::ios::binary);
+
+	if (stream)
 	{
-		cv::cuda::GpuMat img_gpu;
-		img_gpu.upload(resize_img);	// upload image to GPU
+		stream >> std::noskipws;
+		std::copy(std::istream_iterator<char>(stream), std::istream_iterator<char>(), std::back_inserter(buffer));
+	}
 
-		auto img_w = dims.d[2];
-		auto img_h = dims.d[1];
-		auto img_c = dims.d[0];
+	return buffer;
+}
 
-		cv::cuda::GpuMat flt_image;
-		img_gpu.convertTo(flt_image, CV_32FC3, 1.f / 127.5f - 1.f);	// Normalize
-		
-		std::vector<cv::cuda::GpuMat> chw;
+void writeBuffer(void* buffer, size_t size, std::string const& path)
+{
+	std::ofstream stream(path.c_str(), std::ios::binary);
 
-		for (size_t i = 0; i < img_c; i++)
+	if (stream)
+		stream.write(static_cast<char*>(buffer), size);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+ICudaEngine* createCudaEngine(std::string const &onnxModelPath)
+{
+	std::unique_ptr<nvinfer1::IBuilder, Destroy<nvinfer1::IBuilder>> builder{ nvinfer1::createInferBuilder(gLogger) };
+	std::unique_ptr<nvinfer1::INetworkDefinition, Destroy<nvinfer1::INetworkDefinition>> network{ builder->createNetwork() };
+	std::unique_ptr<nvonnxparser::IParser, Destroy<nvonnxparser::IParser>> parser{ nvonnxparser::createParser(*network, gLogger) };
+
+	if (!parser->parseFromFile(onnxModelPath.c_str(), static_cast<int>(ILogger::Severity::kINFO)))
+	{
+		std::cout << "ERROR: could not parse input engine." << std::endl;
+		return nullptr;
+	}
+	return builder->buildCudaEngine(*network); // build and return TensorRT engine
+
+}
+
+ICudaEngine* getCudaEngine(std::string const & onnxModelPath, int batch_size)
+{
+	std::string enginePath{ getBasename(onnxModelPath) + ".onnx"};
+	ICudaEngine* engine{ nullptr };
+
+	std::string buffer = readBuffer(enginePath);
+
+	if (buffer.size())
+	{
+		// Try to deserialize engine.
+		std::unique_ptr<IRuntime, Destroy<IRuntime>> runtime{ createInferRuntime(gLogger) };
+		engine = runtime->deserializeCudaEngine(buffer.data(), buffer.size(), nullptr);
+
+	}
+
+	if (!engine)
+	{
+		// Fallback to creating engine from scratch.
+		engine = createCudaEngine(onnxModelPath);
+
+		if (engine)
 		{
-			chw.emplace_back(cv::cuda::GpuMat(cv::Size(img_w, img_h), CV_32FC1, gpu_input + i * img_w * img_h));
+			std::unique_ptr<IHostMemory, Destroy<IHostMemory>> engine_plan{ engine->serialize() };
+			// Try to save engine for future uses.
+			writeBuffer(engine_plan->data(), engine_plan->size(), enginePath);
 		}
-		
-
-		return chw;
 	}
+	return engine;
 }
 
-void parseOnnxModel(const std::string& model_path, TRTUniquePtr<nvinfer1::ICudaEngine>& engine,
-	TRTUniquePtr< nvinfer1::IExecutionContext >& context)
+static int getBindingInputIndex(IExecutionContext* context)
 {
-	TRTUniquePtr< nvinfer1::IBuilder > builder{ nvinfer1::createInferBuilder(gLogger) };
-	TRTUniquePtr< nvinfer1::INetworkDefinition > network{ builder->createNetwork() };
-	TRTUniquePtr< nvonnxparser::IParser > parser{ nvonnxparser::createParser(*network, gLogger) };
-	// parse ONNX
-	if (!parser->parseFromFile(model_path.c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kINFO)))
-	{
-		std::cerr << "ERROR: could not parse the model.\n";
-		return;
-	}
-	
-	TRTUniquePtr< nvinfer1::IBuilderConfig > config{ builder->createBuilderConfig() };
-	// allow TensorRT to use up to 1GB of GPU memory for tactic selection.
-	config->setMaxWorkspaceSize(1ULL << 30);
-	// use FP16 mode if possible
-	if (builder->platformHasFastFp16())
-	{
-		config->setFlag(nvinfer1::BuilderFlag::kFP16);
-	}
-	// we have only one image in batch
-	builder->setMaxBatchSize(1);
-
+	return !context->getEngine().bindingIsInput(0); // 0 (false) if bindingIsInput(0), 1 (true) otherwise
 }
+
+void launchInference(IExecutionContext* context, cudaStream_t stream, std::vector<float> const& inputTensor, std::vector<float>& outputTensor, void** bindings, int batch_size)
+{
+	int inputId = getBindingInputIndex(context);
+
+	cudaMemcpyAsync(bindings[inputId], inputTensor.data(), inputTensor.size() * sizeof(float), cudaMemcpyHostToDevice, stream);
+	context->enqueue(batch_size, bindings, stream, nullptr);
+	cudaMemcpyAsync(outputTensor.data(), bindings[1 - inputId], outputTensor.size() * sizeof(float), cudaMemcpyDeviceToHost, stream);
+}
+
+void doInference(IExecutionContext* context, cudaStream_t stream, std::vector<float> const& inputTensor, std::vector<float>& outputTensor, void** bindings, int batchSize)
+{
+	int ITERATIONS = 10;
+	cudawrapper::CudaEvent start;
+	cudawrapper::CudaEvent end;
+	double totalTime = 0.0;
+
+	for (int i = 0; i < ITERATIONS; ++i)
+	{
+		float elapsedTime;
+
+		// Measure time it takes to copy input to GPU, run inference and move output back to CPU.
+		cudaEventRecord(start, stream);
+		launchInference(context, stream, inputTensor, outputTensor, bindings, batchSize);
+		cudaEventRecord(end, stream);
+
+		// Wait until the work is finished.
+		cudaStreamSynchronize(stream);
+		cudaEventElapsedTime(&elapsedTime, start, end);
+
+		totalTime += elapsedTime;
+	}
+
+	std::cout << "Inference batch size " << batchSize << " average over " << ITERATIONS << " runs is " << totalTime / ITERATIONS << "ms" << std::endl;
+}
+
+
 int main()
 {
-	std::string path = "C:/Users/Yuhwan/Pictures/����ȯ.jpg";
-	std::string &img_path = path;
 
-	TRTUniquePtr< nvinfer1::ICudaEngine > engine{ nullptr };
-	TRTUniquePtr< nvinfer1::IExecutionContext > context{ nullptr };
+	std::unique_ptr<ICudaEngine, Destroy<ICudaEngine>> engine{ nullptr };
+	std::unique_ptr<IExecutionContext, Destroy<IExecutionContext>> context{ nullptr };
+	std::vector<float> inputTensor;
+	std::vector<float> outputTensor;
+	std::vector<float> referenceTensor;
+	void* bindings[2]{ 0 };
+	std::vector<std::string> inputFiles;
+	cudawrapper::CudaStream stream;
+	
 
-	std::vector< nvinfer1::Dims > input_dims;
-	std::vector< nvinfer1::Dims > output_dims;
-	std::vector< void* > buffers(engine->getNbBindings());
+	std::string onnxModelPath = "C:/Users/Yuhwan/Documents/New/A2B_generator.onnx";
+	int batch_size = 1;
 
-	//vector<cv::cuda::GpuMat> chw = preprocess_img(img_path, (float *)buffers[0], input_dim);
+	// Create Cuda Engine
+	std::cout << "!!!!" << std::endl;
+	engine.reset(getCudaEngine(onnxModelPath, batch_size));	// 이 부분에서 에러가 발생!
+	std::cout << "Did it!!!" << std::endl;
+	if (!engine)
+	{
+		std::cout << "비었다" << std::endl;
+		return 1;
+	}
 
-
-	//int iNum = 10;
-
-	//int *p = &iNum;
-
-	//int i = *p;
-
-	//int &ref = iNum;
-
-	//std::cout << i << std::endl;
-	//std::cout << ref << std::endl;
-
-
+	std::cout << "Did it!!!" << std::endl;
 
 	return 0;
 }
